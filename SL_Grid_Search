@@ -1,0 +1,503 @@
+###############################################################
+# Grid Search for SuperLearner Base Learners (5 x 10-fold CV)
+###############################################################
+
+suppressPackageStartupMessages({
+  library(SuperLearner)
+  library(ranger)
+  library(xgboost)
+  library(glmnet)
+  library(earth)
+  library(kernlab)
+  library(dplyr)
+  library(jsonlite)
+  library(caret)
+})
+
+# ============================================================
+# 1. CONFIG
+# ============================================================
+SEED_MAIN <- 456
+set.seed(SEED_MAIN)
+
+# Number of CV repetitions
+R_REP   <- 5          # e.g., 5 x 10-fold
+V_INNER <- 10         # folds per repetition
+
+# Repro mode: if TRUE, force single-threading for bitwise stability
+REPRO_STRICT <- TRUE
+
+PATH_DATA <- "Data"
+RESPONSE  <- "RelSpeed"
+
+# Threading caps (respect REPRO_STRICT for stochastic learners)
+if (REPRO_STRICT) {
+  Sys.setenv("OMP_NUM_THREADS" = "1", "MKL_NUM_THREADS" = "1")
+  NTHREAD_M1 <- 1L
+} else {
+  Sys.setenv("OMP_NUM_THREADS" = "1", "MKL_NUM_THREADS" = "1")
+  NTHREAD_M1 <- max(1L, parallel::detectCores() - 1L)
+}
+
+# Run tag + output directory
+RUN_TAG <- format(Sys.time(), "%Y%m%d_%H%M%S")
+OUT_DIR <- file.path(getwd(), "sl_grid", RUN_TAG)
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+message("[OUT_DIR] ", OUT_DIR)
+
+# File paths
+FILE_LONG  <- file.path(OUT_DIR, "grid_results_long.csv")
+FILE_BEST  <- file.path(OUT_DIR, "best_params.csv")
+FILE_LIB   <- file.path(OUT_DIR, "best_library.R")
+FILE_FAIL  <- file.path(OUT_DIR, "fail_log.txt")
+FILE_CFG   <- file.path(OUT_DIR, "run_config.json")
+FILE_SESS  <- file.path(OUT_DIR, "session_info.txt")
+FILE_REPRO <- file.path(OUT_DIR, "repro_control.rds")
+
+# ============================================================
+# 2. DATA LOAD + PREPROCESSING
+# ============================================================
+
+map_conference <- function(id) {
+  if (grepl("WF",  id)) return("ACC")
+  if (grepl("AUB", id)) return("SEC")
+  NA_character_
+}
+
+stopifnot(file.exists(PATH_DATA))
+dat_raw <- read.csv(PATH_DATA)
+
+dat <- dat_raw %>%
+  dplyr::filter(!is.na(Lead_Knee_Ang_Vel_Max_PreBR))
+
+# Detect character/factor variables 
+charfac <- names(dat)[vapply(dat, function(x) is.character(x) || is.factor(x), logical(1))]
+charfac <- setdiff(charfac, c("PitchID", "PitcherID"))
+
+# Pitcher-level combine 
+data_combined <- dat %>%
+  dplyr::select(-dplyr::any_of("PitchID")) %>%
+  dplyr::group_by(PitcherID, dplyr::across(dplyr::all_of(charfac))) %>%
+  dplyr::summarise(dplyr::across(where(is.numeric), ~ mean(.x, na.rm = TRUE)),
+                   .groups = "drop")
+
+# Conference labels
+data_combined$conference <- vapply(
+  data_combined$PitcherID, map_conference,
+  FUN.VALUE = character(1)
+)
+data_combined <- dplyr::filter(data_combined, !is.na(conference))
+
+# Modeling frames
+stopifnot(RESPONSE %in% names(data_combined))
+y <- data_combined[[RESPONSE]]
+X <- data_combined %>%
+  dplyr::select(-dplyr::all_of(c(RESPONSE, "PitcherID", "conference")))
+
+# Factor handling
+if ("Handedness" %in% names(X)) {
+  X$Handedness <- factor(X$Handedness)
+}
+
+# Row-level cleaning
+ok <- is.finite(y) & stats::complete.cases(X)
+if (!all(ok)) {
+  cat(sprintf("[clean] Dropping %d rows with NA/non-finite\n", sum(!ok)))
+  X <- X[ok, , drop = FALSE]
+  y <- y[ok]
+}
+
+# Drop zero-variance / all-NA columns
+keep_col <- vapply(
+  X,
+  function(col) {
+    if (all(is.na(col))) return(FALSE)
+    if (is.numeric(col)) return(stats::var(col, na.rm = TRUE) > 0)
+    if (is.factor(col))  return(nlevels(col) > 1)
+    TRUE
+  },
+  logical(1)
+)
+if (!all(keep_col)) {
+  cat(sprintf("[clean] Dropping %d zero-variance/all-NA columns\n", sum(!keep_col)))
+  X <- X[, keep_col, drop = FALSE]
+}
+
+# Uniform interface
+X <- as.data.frame(X)
+stopifnot(is.numeric(y), nrow(X) == length(y))
+
+# ============================================================
+# 2b. PRECOMPUTE REPEATED CV FOLDS (R_REP x V_INNER)
+# ============================================================
+# For each repetition r, folds_list[[r]] is a list of length V_INNER
+set.seed(SEED_MAIN)
+folds_list <- replicate(
+  R_REP,
+  caret::createFolds(y, k = V_INNER, returnTrain = FALSE),
+  simplify = FALSE
+)
+
+# Save repro controls (so you know exactly which folds were used)
+saveRDS(
+  list(
+    seed        = SEED_MAIN,
+    folds_list  = folds_list,
+    r_rep       = R_REP,
+    v_inner     = V_INNER,
+    repro_strict = REPRO_STRICT
+  ),
+  FILE_REPRO
+)
+
+# ============================================================
+# 3. TUNING GRIDS 
+# ============================================================
+
+grid_ranger <- list(
+  mtry          = c(3, 5),
+  min.node.size = c(3, 5, 10),
+  num.trees     = c(500, 800)
+)
+
+grid_xgb <- list(
+  nrounds          = c(120, 180, 240),
+  max_depth        = c(3, 4, 5),
+  eta              = c(0.03, 0.06, 0.10),
+  subsample        = c(0.8, 1.0),
+  colsample_bytree = c(0.7, 0.9)
+)
+
+grid_glmnet <- list(
+  alpha = c(0.1, 0.2, 0.4, 0.6, 0.8)
+)
+
+grid_earth <- list(
+  degree = c(1, 2),
+  nk     = c(15, 25, 35)
+)
+
+grid_ksvm <- list(
+  C      = c(0.5, 1, 2),
+  kernel = "rbfdot"
+)
+
+# ============================================================
+# 4. WRAPPER CREATION 
+# ============================================================
+# create.Learner writes functions into env
+make_lib <- function(prefix, base, grid, params = list()) {
+  if (is.null(grid)) {
+    return(list(names = character(0), grid = NULL))
+  }
+  L <- SuperLearner::create.Learner(
+    base,
+    tune           = grid,
+    params         = params,
+    detailed_names = TRUE,
+    name_prefix    = prefix,
+    env            = .GlobalEnv
+  )
+  combos <- do.call(expand.grid, c(grid, stringsAsFactors = FALSE))
+  combos$learner <- L$names
+  list(names = L$names, grid = combos)
+}
+
+# Stochastic learners get explicit seeds + thread controls
+lib_rgr <- make_lib(
+  "rgr", "SL.ranger", grid_ranger,
+  params = list(num.threads = NTHREAD_M1, write.forest = TRUE, seed = SEED_MAIN)
+)
+lib_xgb <- make_lib(
+  "xgb", "SL.xgboost", grid_xgb,
+  params = list(
+    nthread   = NTHREAD_M1,
+    tree_method = "hist",
+    max_bin   = 256,
+    objective = "reg:squarederror",
+    seed      = SEED_MAIN
+  )
+)
+lib_glm <- make_lib("glm",  "SL.glmnet", grid_glmnet)
+lib_mrs <- make_lib("mars", "SL.earth",  grid_earth)
+lib_ksv <- if (!is.null(grid_ksvm)) {
+  make_lib("ksv", "SL.ksvm", grid_ksvm)
+} else {
+  list(names = character(0), grid = NULL)
+}
+
+check_wrappers <- function(nms) {
+  for (nm in nms) {
+    obj <- get(nm, inherits = TRUE)
+    if (!is.function(obj)) {
+      stop(sprintf("Wrapper %s is not a function; got %s",
+                   nm, class(obj)[1]))
+    }
+  }
+}
+
+check_wrappers(lib_rgr$names)
+check_wrappers(lib_xgb$names)
+check_wrappers(lib_glm$names)
+check_wrappers(lib_mrs$names)
+if (length(lib_ksv$names)) check_wrappers(lib_ksv$names)
+
+# ============================================================
+# 5. MAPPING WRAPPER → cvRisk / Z COLUMN
+# ============================================================
+
+sl_locate <- function(fit, nm) {
+  cvn    <- names(fit$cvRisk)
+  nm_all <- paste0(nm, "_All")
+  
+  # Prefer *_All names when present
+  j_cv <- match(nm_all, cvn)
+  if (is.na(j_cv)) j_cv <- match(nm, cvn)
+  if (is.na(j_cv)) {
+    cand <- which(startsWith(cvn, nm))
+    if (length(cand) == 1) j_cv <- cand
+  }
+  if (is.na(j_cv)) {
+    stop(sprintf("Wrapper '%s' not found in cvRisk names: %s",
+                 nm, paste(cvn, collapse = ", ")))
+  }
+  
+  zn <- colnames(fit$Z)
+  if (!is.null(zn)) {
+    j_z <- match(cvn[j_cv], zn)
+    if (is.na(j_z)) j_z <- match(nm, zn)
+    if (is.na(j_z)) {
+      candz <- which(startsWith(zn, nm))
+      if (length(candz) == 1) j_z <- candz
+    }
+  } else {
+    # Fallback if Z has no column names
+    j_z <- j_cv
+  }
+  
+  if (is.na(j_z)) {
+    stop("Could not align cvRisk entry to Z column.")
+  }
+  
+  list(
+    j_cv    = j_cv,
+    j_z     = j_z,
+    cv_name = cvn[j_cv]
+  )
+}
+
+# ============================================================
+# 6. EVALUATION OF A SINGLE CANDIDATE WRAPPER (REPEATED CV)
+# ============================================================
+
+eval_candidate <- function(wrapper_name, V = V_INNER) {
+  XX <- X
+  mse_vec <- numeric(R_REP)
+  
+  for (r in seq_len(R_REP)) {
+    cv_ctrl <- list(V = V, validRows = folds_list[[r]])
+    res_one <- tryCatch({
+      fit <- SuperLearner(
+        Y          = y,
+        X          = XX,
+        family     = gaussian(),
+        SL.library = c(wrapper_name, "SL.mean"),
+        cvControl  = cv_ctrl
+      )
+      loc <- sl_locate(fit, wrapper_name)
+      mse <- suppressWarnings(as.numeric(fit$cvRisk[loc$j_cv]))
+      rm(fit); gc(FALSE)
+      mse
+    }, error = function(e) {
+      attr(NA_real_, "err") <- conditionMessage(e)
+      NA_real_
+    })
+    
+    mse_vec[r] <- res_one
+    # Early break if catastrophic failure across first repetition
+    if (!is.finite(res_one)) break
+  }
+  
+  if (!all(is.finite(mse_vec))) {
+    # Pick the first error message if available
+    err_msg <- NULL
+    for (r in seq_len(R_REP)) {
+      if (!is.finite(mse_vec[r])) {
+        err_msg <- attr(mse_vec[r], "err")
+        break
+      }
+    }
+    return(list(ok = FALSE, rmse = NA_real_, msg = err_msg %||% "NA cvRisk"))
+  }
+  
+  mse_mean <- mean(mse_vec)
+  list(
+    ok   = is.finite(mse_mean),
+    rmse = if (is.finite(mse_mean)) sqrt(mse_mean) else NA_real_,
+    msg  = if (is.finite(mse_mean)) NA_character_ else "NA cvRisk"
+  )
+}
+
+`%||%` <- function(x, y) if (!is.null(x)) x else y
+
+# ============================================================
+# 7. RESUME-SAFE BOOKKEEPING
+# ============================================================
+
+if (file.exists(FILE_LONG)) {
+  res_long <- read.csv(FILE_LONG, stringsAsFactors = FALSE)
+} else {
+  res_long <- data.frame(
+    Algorithm  = character(),
+    Wrapper    = character(),
+    RMSE       = numeric(),
+    Status     = character(),
+    ParamsJSON = character(),
+    Seconds    = numeric(),
+    stringsAsFactors = FALSE
+  )
+}
+
+already_done <- function(wrapper_name) {
+  any(res_long$Wrapper == wrapper_name &
+        res_long$Status %in% c("OK", "FAIL"))
+}
+
+append_result <- function(algo, nm, rmse, status, params_json, secs, msg = NULL) {
+  row <- data.frame(
+    Algorithm  = algo,
+    Wrapper    = nm,
+    RMSE       = rmse,
+    Status     = status,
+    ParamsJSON = params_json,
+    Seconds    = secs,
+    stringsAsFactors = FALSE
+  )
+  res_long <<- rbind(res_long, row)
+  utils::write.csv(res_long, FILE_LONG, row.names = FALSE)
+  
+  if (!is.null(msg) && status == "FAIL") {
+    cat(sprintf("[%s][FAIL] %s (%.1fs) :: %s\n",
+                format(algo, width = 7, justify = "left"),
+                nm, secs, msg))
+    write(
+      paste(Sys.time(), algo, nm, sprintf("[%.1fs]", secs), msg),
+      file  = FILE_FAIL,
+      append = TRUE
+    )
+  } else if (status == "OK") {
+    cat(sprintf("[%s][ OK ] %s  RMSE=%.4f  (%.1fs)\n",
+                format(algo, width = 7, justify = "left"),
+                nm, rmse, secs))
+  }
+}
+
+process_group <- function(algo_name, learner_obj) {
+  total  <- length(learner_obj$names)
+  done   <- sum(vapply(learner_obj$names, already_done, logical(1)))
+  remain <- total - done
+  
+  cat(sprintf("[%s] total=%d, cached=%d, remaining=%d\n",
+              algo_name, total, done, remain))
+  if (remain == 0) return(invisible(NULL))
+  
+  for (nm in learner_obj$names) {
+    if (already_done(nm)) next
+    
+    # Params for this wrapper (for logging only)
+    pr <- as.list(learner_obj$grid[learner_obj$grid$learner == nm, , drop = FALSE])
+    params_json <- tryCatch(
+      jsonlite::toJSON(pr, auto_unbox = TRUE),
+      error = function(e) "{}"
+    )
+    
+    t0  <- Sys.time()
+    res <- eval_candidate(nm)
+    secs <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+    
+    status <- if (isTRUE(res$ok)) "OK" else "FAIL"
+    append_result(
+      algo        = algo_name,
+      nm          = nm,
+      rmse        = ifelse(isTRUE(res$ok), res$rmse, NA_real_),
+      status      = status,
+      params_json = params_json,
+      secs        = secs,
+      msg         = res$msg
+    )
+  }
+  invisible(NULL)
+}
+
+# ============================================================
+# 8. RUN GRID SEARCH
+# ============================================================
+
+cat("## ---- Grid search (resume-safe, 5 x 10-fold CV) ----\n")
+process_group("ranger",  lib_rgr)
+process_group("xgboost", lib_xgb)
+process_group("glmnet",  lib_glm)
+process_group("earth",   lib_mrs)
+if (length(lib_ksv$names)) process_group("ksvm", lib_ksv)
+
+# ============================================================
+# 9. BEST-PER-ALGORITHM + LIBRARY SNIPPET
+# ============================================================
+
+if (nrow(res_long) > 0) {
+  ok_df <- res_long %>%
+    dplyr::filter(Status == "OK", is.finite(RMSE))
+  
+  if (nrow(ok_df) > 0) {
+    best_df <- ok_df %>%
+      dplyr::group_by(Algorithm) %>%
+      dplyr::slice_min(order_by = RMSE, n = 1, with_ties = FALSE) %>%
+      dplyr::ungroup()
+    
+    write.csv(best_df, FILE_BEST, row.names = FALSE)
+    
+    sl_vec <- c(best_df$Wrapper, "SL.mean")
+    snippet <- c(
+      "# Auto-generated by grid search (5 x 10-fold CV)",
+      sprintf("sl_best_lib <- c(%s)",
+              paste(sprintf('\"%s\"', sl_vec), collapse = ", ")),
+      "",
+      "# Example (ensure X is a data.frame):",
+      "# final_model <- SuperLearner(",
+      "#   Y = y, X = as.data.frame(X), family = gaussian(),",
+      "#   SL.library = sl_best_lib,",
+      "#   cvControl = list(V = 10)", 
+      "# )",
+      "# For repeated-CV performance estimates, mimic the folds_list pattern."
+    )
+    writeLines(snippet, con = FILE_LIB)
+  }
+}
+
+# ============================================================
+# 10. PROVENANCE
+# ============================================================
+
+sink(FILE_SESS); print(sessionInfo()); sink()
+
+cfg <- list(
+  run_tag      = RUN_TAG,
+  path_data    = PATH_DATA,
+  response     = RESPONSE,
+  v_inner      = V_INNER,
+  r_rep        = R_REP,
+  nthread_m1   = NTHREAD_M1,
+  repro_strict = REPRO_STRICT,
+  interface    = "data.frame",
+  seed         = SEED_MAIN
+)
+writeLines(jsonlite::toJSON(cfg, pretty = TRUE), FILE_CFG)
+
+cat("\n✅ Grid search complete.\n  Output dir: ", OUT_DIR, "\n", sep = "")
+cat("Files:\n - grid_results_long.csv\n",
+    " - best_params.csv\n",
+    " - best_library.R\n",
+    " - fail_log.txt\n",
+    " - session_info.txt\n",
+    " - run_config.json\n",
+    " - repro_control.rds\n", sep = "")
