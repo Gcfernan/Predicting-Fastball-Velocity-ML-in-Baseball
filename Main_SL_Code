@@ -1,0 +1,1329 @@
+# =====================================================================
+# Super Learner Ensemble Model for Predicting Fastball Velocity
+# =====================================================================
+
+
+# -------------------------
+# 1. Global Config
+# -------------------------
+SEED_MAIN        <- 456       #456
+
+data_path        <- "Data"
+out_dir          <- "outputs"
+plots_dir        <- file.path(out_dir, "plots")
+
+# Cross-validation controls
+K_FOLDS_MAIN      <- 10     # max outer folds for main CV
+K_FOLDS_MAX_INNER <- 5      # max inner folds internal CV
+
+# Bootstrap sizes
+B_OOF      <- 2000   # OOF bootstrap (internal CV metrics)
+B_FOLDS    <- 2000   # fold-level bootstrap
+B_IE       <- 2000   # IE bootstrap on fixed model
+B_IE_FULL  <- 2000   # IE full-refit bootstrap
+INNER_V_IE <- 2      # inner V for full-refit IE bootstrap
+
+# Feature switches
+DO_SCREEN       <- TRUE    # predictor screening (NZV, |r|>0.8, VIF>5)
+USE_PAR_IE_BOOT <- FALSE   # parallel for full-refit IE bootstrap
+
+# Fixed axis limits for IE error-bar figures
+axes_ACC <- list(x = c(85, 102), y = c(85, 98))  # SEC → ACC test
+axes_SEC <- list(x = c(85, 102), y = c(85, 98))  # ACC → SEC test
+
+set.seed(SEED_MAIN)
+if (!dir.exists(out_dir))   dir.create(out_dir, recursive = TRUE)
+if (!dir.exists(plots_dir)) dir.create(plots_dir, recursive = TRUE)
+
+
+# -------------------------
+# 2. Packages
+# -------------------------
+packages <- c(
+  "SuperLearner","caret","ranger","xgboost","glmnet","earth","kernlab",
+  "naniar","ggplot2","ggrepel","dplyr","reshape2","pmsampsize","nnls",
+  "parallel","car"
+)
+lapply(packages, function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+})
+lapply(packages, library, character.only = TRUE)
+
+
+# -------------------------
+# 3. Sample Size Calculation
+# -------------------------
+pmsampsize::pmsampsize(
+  type       = "c",
+  rsquared   = 0.30,
+  parameters = 15,
+  intercept  = 80.8,
+  sd         = 7.6
+)
+
+
+# -------------------------
+# 4. Helper Functions
+# -------------------------
+
+## 4.1 Conference mapping
+map_conference <- function(id) {
+  if (grepl("WF", id))  return("ACC")
+  if (grepl("AUB", id)) return("SEC")
+  return(NA_character_)
+}
+
+## 4.2 Safe data.frame for SL wrappers
+.sl_df <- function(z) {
+  if (is.data.frame(z)) return(z)
+  z <- as.data.frame(z, stringsAsFactors = FALSE)
+  names(z) <- make.names(names(z), unique = TRUE)
+  z
+}
+
+## 4.3 Tuned SuperLearner base learners (from grid-search results)
+create_tuned_learners <- function() {
+  
+  SL.ranger.tuned <- function(X, Y, newX, family, obsWeights = NULL, id = NULL, ...) {
+    X <- .sl_df(X); newX <- .sl_df(newX)
+    nt <- get0("NTHREAD_M1", ifnotfound = NULL, inherits = TRUE)
+    extra <- if (is.null(nt)) list() else list(num.threads = as.integer(nt))
+    do.call(SL.ranger, c(
+      list(X=X, Y=Y, newX=newX, family=family, obsWeights=obsWeights, id=id),
+      list(num.trees=800L, mtry=5L, min.node.size=5L, write.forest=TRUE),
+      extra,
+      list(...)
+    ))
+  }
+  
+  SL.xgboost.tuned <- function(X, Y, newX, family, obsWeights = NULL, id = NULL, ...) {
+    X <- .sl_df(X); newX <- .sl_df(newX)
+    do.call(SL.xgboost, c(
+      list(X=X, Y=Y, newX=newX, family=family, obsWeights=obsWeights, id=id),
+      list(nrounds=120L, max_depth=5L, eta=0.03, subsample=0.8, colsample_bytree=0.7),
+      list(...)
+    ))
+  }
+  
+  SL.glmnet.tuned <- function(X, Y, newX, family, obsWeights = NULL, id = NULL, ...) {
+    X <- .sl_df(X); newX <- .sl_df(newX)
+    do.call(SL.glmnet, c(
+      list(X=X, Y=Y, newX=newX, family=family, obsWeights=obsWeights, id=id),
+      list(alpha=0.4),
+      list(...)
+    ))
+  }
+  
+  SL.earth.tuned <- function(X, Y, newX, family, obsWeights = NULL, id = NULL, ...) {
+    X <- .sl_df(X); newX <- .sl_df(newX)
+    do.call(SL.earth, c(
+      list(X=X, Y=Y, newX=newX, family=family, obsWeights=obsWeights, id=id),
+      list(degree=1L, nk=35L),
+      list(...)
+    ))
+  }
+  
+  SL.ksvm.tuned <- function(X, Y, newX, family, obsWeights = NULL, id = NULL, ...) {
+    X <- .sl_df(X); newX <- .sl_df(newX)
+    do.call(SL.ksvm, c(
+      list(X=X, Y=Y, newX=newX, family=family, obsWeights=obsWeights, id=id),
+      list(kernel="rbfdot", C=0.5),
+      list(...)
+    ))
+  }
+  
+  funs <- list(
+    SL.ranger.tuned = SL.ranger.tuned,
+    SL.xgboost.tuned = SL.xgboost.tuned,
+    SL.glmnet.tuned  = SL.glmnet.tuned,
+    SL.earth.tuned   = SL.earth.tuned,
+    SL.ksvm.tuned    = SL.ksvm.tuned
+  )
+  
+  # Register in SuperLearner namespace and global env
+  for (nm in names(funs)) {
+    environment(funs[[nm]]) <- asNamespace("SuperLearner")
+    assign(nm, funs[[nm]], envir = .GlobalEnv)
+  }
+  funs
+}
+
+# Register tuned learners + libraries
+tuned_learners <- create_tuned_learners()
+sl_lib         <- c("SL.ranger.tuned","SL.xgboost.tuned","SL.glmnet.tuned",
+                    "SL.earth.tuned","SL.ksvm.tuned","SL.mean")
+sl_lib_no_mean <- setdiff(sl_lib, "SL.mean")
+
+
+## 4.4 Metrics helper
+.metricise <- function(y, p) {
+  mse  <- mean((y - p)^2)
+  rmse <- sqrt(mse)
+  mae  <- mean(abs(y - p))
+  r2   <- 1 - sum((y - p)^2) / sum((y - mean(y))^2)
+  data.frame(RMSE=rmse, MAE=mae, R2=r2)
+}
+
+## 4.5 Variable importance (weighted across learners)
+get_variable_importance <- function(model, X) {
+  vars <- colnames(X); wts <- model$coef
+  agg  <- setNames(numeric(length(vars)), vars)
+  
+  add_imp <- function(imp_named, weight) {
+    v <- setNames(numeric(length(vars)), vars)
+    in_both <- intersect(names(imp_named), vars)
+    if (length(in_both)) v[in_both] <- imp_named[in_both]
+    agg <<- agg + weight * (v / max(1e-12, sum(v)))
+  }
+  
+  for (alg in names(wts)) {
+    if (wts[alg] <= 0 || alg == "SL.mean") next
+    fit <- model$fitLibrary[[alg]]$object
+    
+    if (grepl("ranger", alg) && !is.null(fit$variable.importance)) {
+      imp <- fit$variable.importance; imp <- imp[!is.na(imp)]
+      add_imp(imp, wts[alg]); next
+    }
+    
+    if (grepl("xgboost", alg)) {
+      imp_tbl <- try(xgb.importance(model=fit), silent=TRUE)
+      if (!inherits(imp_tbl,"try-error") && nrow(imp_tbl)>0) {
+        f <- imp_tbl$Feature
+        names_vec <- if (all(grepl("^[0-9]+$", f))) {
+          vars[pmin(length(vars), as.integer(f)+1L)]
+        } else f
+        imp <- setNames(imp_tbl$Gain, names_vec)
+        add_imp(imp, wts[alg]); next
+      }
+    }
+    
+    if (grepl("glmnet", alg)) {
+      co <- try(as.matrix(coef(fit, s="lambda.min")), silent=TRUE)
+      if (!inherits(co,"try-error")) {
+        co <- co[-1, , drop=FALSE]
+        imp <- abs(as.numeric(co)); names(imp) <- rownames(co); imp <- imp[imp>0]
+        add_imp(imp, wts[alg]); next
+      }
+    }
+  }
+  sort(agg / sum(agg), decreasing=TRUE)
+}
+
+## 4.6 IE bootstrap CIs (test-set bootstrap)
+.ie_boot_ci <- function(df, B = 2000, seed = SEED_MAIN) {
+  stopifnot(all(c("Actual","Predicted") %in% names(df)))
+  set.seed(seed)
+  n <- nrow(df)
+  
+  boot_stats <- replicate(B, {
+    idx <- sample.int(n, n, replace = TRUE)
+    a <- df$Actual[idx]; p <- df$Predicted[idx]
+    mse  <- mean((a - p)^2)
+    rmse <- sqrt(mse)
+    mae  <- mean(abs(a - p))
+    r2   <- 1 - sum((a - p)^2) / sum((a - mean(a))^2)
+    co   <- coef(lm(a ~ p))
+    c(RMSE = rmse, MAE = mae, R2 = r2,
+      Cal_Slope = unname(co[2]), Cal_Intercept = unname(co[1]))
+  })
+  boot_stats <- t(boot_stats)
+  
+  mse0 <- mean((df$Actual - df$Predicted)^2)
+  ests <- c(
+    RMSE          = sqrt(mse0),
+    MAE           = mean(abs(df$Actual - df$Predicted)),
+    R2            = 1 - sum((df$Actual - df$Predicted)^2) / sum((df$Actual - mean(df$Actual))^2),
+    Cal_Slope     = unname(coef(lm(Actual ~ Predicted, data=df))[2]),
+    Cal_Intercept = unname(coef(lm(Actual ~ Predicted, data=df))[1])
+  )
+  
+  q025_975 <- function(x) stats::quantile(x, c(0.025, 0.975), na.rm = TRUE, names = FALSE)
+  ci_rmse <- q025_975(boot_stats[,"RMSE"])
+  ci_mae  <- q025_975(boot_stats[,"MAE"])
+  ci_r2   <- q025_975(boot_stats[,"R2"])
+  ci_sl   <- q025_975(boot_stats[,"Cal_Slope"])
+  ci_int  <- q025_975(boot_stats[,"Cal_Intercept"])
+  
+  out <- data.frame(
+    Metric    = names(ests),
+    Est       = as.numeric(ests),
+    CI_Lower  = c(ci_rmse[1], ci_mae[1], ci_r2[1], ci_sl[1], ci_int[1]),
+    CI_Upper  = c(ci_rmse[2], ci_mae[2], ci_r2[2], ci_sl[2], ci_int[2]),
+    row.names = NULL, check.names = FALSE
+  )
+  
+  swap <- out$CI_Lower > out$CI_Upper
+  if (any(swap)) {
+    tmp <- out$CI_Lower[swap]
+    out$CI_Lower[swap] <- out$CI_Upper[swap]
+    out$CI_Upper[swap] <- tmp
+  }
+  out
+}
+
+## 4.7 OOF-bootstrap CIs (internal CV)
+.oof_boot_ci <- function(y, p, B = 2000, seed = SEED_MAIN) {
+  stopifnot(length(y) == length(p))
+  set.seed(seed)
+  n <- length(y)
+  boot_stats <- replicate(B, {
+    idx <- sample.int(n, replace = TRUE)
+    a <- y[idx]; pr <- p[idx]
+    mse  <- mean((a - pr)^2); rmse <- sqrt(mse)
+    mae  <- mean(abs(a - pr))
+    r2   <- 1 - sum((a - pr)^2) / sum((a - mean(a))^2)
+    fit  <- lm(a ~ pr)
+    c(rmse = rmse, mae = mae, r2 = r2,
+      slope = unname(coef(fit)[2]),
+      intercept = unname(coef(fit)[1]))
+  })
+  boot_stats <- t(boot_stats)
+  ci <- function(x) quantile(x, c(0.025, 0.975), na.rm = TRUE, names = FALSE)
+  
+  mse0 <- mean((y - p)^2); rmse0 <- sqrt(mse0)
+  mae0 <- mean(abs(y - p))
+  r20  <- 1 - sum((y - p)^2) / sum((y - mean(y))^2)
+  co0  <- coef(lm(y ~ p))
+  
+  data.frame(
+    Metric   = c("RMSE","MAE","R2","Cal_Slope","Cal_Intercept"),
+    Est      = c(rmse0, mae0, r20, unname(co0[2]), unname(co0[1])),
+    CI_Lower = c(ci(boot_stats[,"rmse"])[1],
+                 ci(boot_stats[,"mae"])[1],
+                 ci(boot_stats[,"r2"])[1],
+                 ci(boot_stats[,"slope"])[1],
+                 ci(boot_stats[,"intercept"])[1]),
+    CI_Upper = c(ci(boot_stats[,"rmse"])[2],
+                 ci(boot_stats[,"mae"])[2],
+                 ci(boot_stats[,"r2"])[2],
+                 ci(boot_stats[,"slope"])[2],
+                 ci(boot_stats[,"intercept"])[2]),
+    row.names = NULL, stringsAsFactors = FALSE
+  )
+}
+
+## 4.8 Fold-bootstrap CIs (averaged over folds)
+.cv_fold_boot_ci <- function(fold_metrics_df, B = 2000, seed = SEED_MAIN) {
+  stopifnot(all(c("RMSE","MAE","R2","Cal_Slope","Cal_Intercept") %in% names(fold_metrics_df)))
+  set.seed(seed)
+  k <- nrow(fold_metrics_df)
+  
+  boot_mat <- replicate(B, {
+    idx <- sample.int(k, replace = TRUE)
+    c(RMSE          = mean(fold_metrics_df$RMSE[idx],          na.rm = TRUE),
+      MAE           = mean(fold_metrics_df$MAE[idx],           na.rm = TRUE),
+      R2            = mean(fold_metrics_df$R2[idx],            na.rm = TRUE),
+      Cal_Slope     = mean(fold_metrics_df$Cal_Slope[idx],     na.rm = TRUE),
+      Cal_Intercept = mean(fold_metrics_df$Cal_Intercept[idx], na.rm = TRUE))
+  })
+  boot_mat <- t(boot_mat)
+  
+  ci <- function(x) stats::quantile(x, c(0.025, 0.975), na.rm = TRUE, names = FALSE)
+  
+  point <- c(RMSE         = mean(fold_metrics_df$RMSE,         na.rm = TRUE),
+             MAE          = mean(fold_metrics_df$MAE,          na.rm = TRUE),
+             R2           = mean(fold_metrics_df$R2,           na.rm = TRUE),
+             Cal_Slope    = mean(fold_metrics_df$Cal_Slope,    na.rm = TRUE),
+             Cal_Intercept= mean(fold_metrics_df$Cal_Intercept,na.rm = TRUE))
+  
+  data.frame(
+    Metric   = names(point),
+    Est      = as.numeric(point),
+    CI_Lower = c(ci(boot_mat[,"RMSE"]),
+                 ci(boot_mat[,"MAE"]),
+                 ci(boot_mat[,"R2"]),
+                 ci(boot_mat[,"Cal_Slope"]),
+                 ci(boot_mat[,"Cal_Intercept"])),
+    CI_Upper = c(ci(boot_mat[,"RMSE"])[2],
+                 ci(boot_mat[,"MAE"])[2],
+                 ci(boot_mat[,"R2"])[2],
+                 ci(boot_mat[,"Cal_Slope"])[2],
+                 ci(boot_mat[,"Cal_Intercept"])[2]),
+    row.names = NULL, stringsAsFactors = FALSE
+  )
+}
+
+## 4.9 Calibration plot helper (used for IE and internal OOF)
+.save_cal_plot <- function(df, title_txt, filename_png, with_se=FALSE) {
+  gp <- ggplot(df, aes(x=Actual, y=Predicted)) +
+    geom_point(alpha=0.75) +
+    geom_abline(slope=1, intercept=0, linetype="dashed", color="gray50") +
+    geom_smooth(method="lm", se=with_se, color="red") +
+    labs(title=title_txt, x="Actual Velocity", y="Predicted Velocity") +
+    theme_minimal() +
+    coord_equal()
+  ggsave(filename=file.path(plots_dir, filename_png), plot=gp, width=8, height=6, dpi=300)
+}
+
+## 4.10 External validation helper (single direction)
+run_external_validation <- function(data, train_conf, test_conf) {
+  # indices in data_combined
+  train_idx <- which(data$conference == train_conf)
+  test_idx  <- which(data$conference == test_conf)
+  
+  # use the already screened X and aligned y
+  X_train <- X[train_idx, , drop = FALSE]
+  y_train <- y[train_idx]
+  X_test  <- X[test_idx,  , drop = FALSE]
+  y_test  <- y[test_idx]
+  
+  model <- SuperLearner(
+    Y = y_train, X = X_train, family = gaussian(), SL.library = sl_lib,
+    cvControl = list(V = max(2, min(5, floor(nrow(X_train)/3))))
+  )
+  preds <- predict(model, newdata = X_test)$pred
+  
+  # align weights etc.
+  w_raw <- model$coef
+  lib_all <- paste0(sl_lib, "_All")
+  w_aligned <- setNames(rep(0, length(lib_all)), lib_all)
+  w_aligned[names(w_raw)] <- as.numeric(w_raw)
+  s <- sum(w_aligned); if (is.finite(s) && s > 0) w_aligned <- w_aligned / s
+  
+  list(
+    metrics  = .metricise(y_test, preds),
+    preds_df = data.frame(Actual = y_test, Predicted = preds,
+                          Conference = test_conf),
+    weights  = w_aligned,
+    model    = model
+  )
+}
+
+
+
+# -------------------------
+# 5. Load and Preprocess Data
+# -------------------------
+data <- read.csv(data_path)
+
+# Missingness summary
+miss_summary <- naniar::miss_var_summary(data) %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), as.numeric)) %>%
+  as.data.frame()
+write.csv(miss_summary, file.path(out_dir, "missingness_summary.csv"), row.names=FALSE)
+
+# Complete-case filter for key variable
+data <- data %>% dplyr::filter(!is.na(Lead_Knee_Ang_Vel_Max_PreBR))
+
+# Pitcher-level aggregation
+data_combined <- data %>%
+  dplyr::select(-PitchID) %>%
+  dplyr::group_by(PitcherID, dplyr::across(where(is.factor) | where(is.character))) %>%
+  dplyr::summarise(dplyr::across(where(is.numeric), \(x) mean(x, na.rm=TRUE)), .groups="drop")
+
+# Conference mapping
+data_combined$conference <- sapply(data_combined$PitcherID, map_conference)
+data_combined <- data_combined %>% dplyr::filter(!is.na(conference))
+
+# Modeling frames
+X <- data_combined %>% dplyr::select(-RelSpeed, -PitcherID, -conference)
+y <- data_combined$RelSpeed
+if ("Handedness" %in% names(X)) X$Handedness <- as.factor(X$Handedness)
+
+
+# -------------------------
+# 6. Predictor Screening 
+# -------------------------
+if (DO_SCREEN) {
+  screen_log <- list()
+  
+  # 6.1 Near-zero variance
+  nzv_idx <- caret::nearZeroVar(X, freqCut = 20, uniqueCut = 10)
+  removed_nzv <- if (length(nzv_idx)) colnames(X)[nzv_idx] else character(0)
+  if (length(removed_nzv)) X <- X[, -nzv_idx, drop = FALSE]
+  screen_log$near_zero_variance <- removed_nzv
+  
+  # 6.2 High correlation (|r| > 0.80) on one-hot expanded design
+  M  <- model.matrix(~ . - 1, data = X)
+  cm <- suppressWarnings(cor(M, use = "pairwise.complete.obs"))
+  high_names <- if (!is.null(dim(cm))) caret::findCorrelation(cm, cutoff = 0.80, names = TRUE, exact = TRUE) else character(0)
+  map_to_orig <- function(nm) sub("^([^^:]+).*", "\\1", nm)
+  high_orig <- unique(map_to_orig(high_names))
+  high_orig <- intersect(high_orig, colnames(X))
+  if (length(high_orig)) X <- X[, setdiff(colnames(X), high_orig), drop = FALSE]
+  screen_log$high_correlation_removed <- high_orig
+  
+  # 6.3 VIF > 5 (adjusting GVIF for factors)
+  M2 <- as.data.frame(model.matrix(~ . , data = X))
+  if ("(Intercept)" %in% names(M2)) M2 <- M2[, setdiff(names(M2), "(Intercept)"), drop = FALSE]
+  lm_tmp <- lm(y ~ ., data = cbind(y = y, M2))
+  vif_vals <- car::vif(lm_tmp)
+  if (is.matrix(vif_vals)) {
+    adj <- vif_vals[, "GVIF"]^(1/(2*vif_vals[, "Df"]))
+    names(adj) <- rownames(vif_vals)
+    vif_flag <- names(adj)[adj > 5]
+  } else {
+    vif_flag <- names(vif_vals)[vif_vals > 5]
+  }
+  vif_orig <- unique(map_to_orig(vif_flag))
+  vif_orig <- intersect(vif_orig, colnames(X))
+  if (length(vif_orig)) X <- X[, setdiff(colnames(X), vif_orig), drop = FALSE]
+  screen_log$vif_gt5_removed <- vif_orig
+  
+  screen_df <- data.frame(
+    step = rep(names(screen_log), lengths(screen_log)),
+    variable = unlist(screen_log, use.names = FALSE),
+    stringsAsFactors = FALSE
+  )
+  if (!nrow(screen_df)) screen_df <- data.frame(step=character(0), variable=character(0))
+  write.csv(screen_df, file.path(out_dir, "predictor_screening_removed.csv"), row.names = FALSE)
+}
+
+# Lock in final predictor set and conference vector
+PRED_VARS <- colnames(X)
+conf_vec  <- data_combined$conference
+
+
+# -------------------------
+# 7. K-Fold CV (OOF preds + per-fold weights)
+# -------------------------
+k_folds  <- min(K_FOLDS_MAIN, max(2, floor(nrow(X)/3)))
+folds    <- caret::createFolds(y, k=k_folds, returnTrain=FALSE)
+
+metrics  <- data.frame(
+  Fold = 1:k_folds,
+  MSE = NA_real_, RMSE = NA_real_, MAE = NA_real_, R2 = NA_real_,
+  Cal_Slope = NA_real_, Cal_Intercept = NA_real_
+)
+oof_preds <- numeric(length(y))
+
+# OOF base-learner predictions
+oof_base <- matrix(
+  NA_real_, nrow=length(y), ncol=length(sl_lib_no_mean),
+  dimnames=list(NULL, paste0(sl_lib_no_mean,"_All"))
+)
+
+# Per-fold SL weights (aligned to *_All)
+weights_mat <- matrix(
+  NA_real_, nrow=k_folds, ncol=length(sl_lib),
+  dimnames=list(Fold=1:k_folds, Algorithm=paste0(sl_lib,"_All"))
+)
+
+for (i in 1:k_folds) {
+  idx_test <- folds[[i]]
+  x_train <- X[-idx_test,, drop=FALSE]; y_train <- y[-idx_test]
+  x_test  <- X[idx_test,,  drop=FALSE]; y_test  <- y[idx_test]
+  
+  model <- SuperLearner(
+    Y=y_train, X=x_train, family=gaussian(), SL.library=sl_lib,
+    cvControl=list(V = max(2, min(K_FOLDS_MAX_INNER, floor(nrow(x_train)/3))))
+  )
+  
+  # Normalized weights
+  w_raw <- model$coef
+  w_row <- setNames(rep(0, length(paste0(sl_lib,"_All"))), paste0(sl_lib,"_All"))
+  w_row[names(w_raw)] <- as.numeric(w_raw)
+  s <- sum(w_row); if (is.finite(s) && s>0) w_row <- w_row / s
+  weights_mat[i, ] <- as.numeric(w_row)
+  
+  # OOF predictions from SL
+  pred <- predict(model, newdata=x_test)$pred
+  oof_preds[idx_test] <- pred
+  
+  # Base-learner OOF preds via library.predict
+  libpred <- try(predict(model, newdata=x_test, onlySL=TRUE)$library.predict, silent=TRUE)
+  if (!inherits(libpred, "try-error")) {
+    common <- intersect(colnames(libpred), paste0(sl_lib_no_mean,"_All"))
+    if (length(common)) {
+      oof_base[idx_test, common] <- libpred[, common, drop=FALSE]
+    }
+  }
+  
+  # Fold metrics + calibration
+  mse <- mean((y_test - pred)^2); rmse <- sqrt(mse); mae <- mean(abs(y_test - pred))
+  r2  <- 1 - sum((y_test - pred)^2) / sum((y_test - mean(y_test))^2)
+  fit_fold <- lm(y_test ~ pred)
+  cal_slope <- unname(coef(fit_fold)[2])
+  cal_int   <- unname(coef(fit_fold)[1])
+  
+  metrics[i, 2:7] <- c(mse, rmse, mae, r2, cal_slope, cal_int)
+}
+
+summary_metrics <- metrics %>%
+  dplyr::summarise(dplyr::across(MSE:R2, list(mean=mean, sd=sd), na.rm=TRUE))
+cat("Cross-Validation Metrics Summary:\n"); print(summary_metrics)
+
+
+# -------------------------
+# 8. Internal OOF calibration + CIs
+# -------------------------
+fit_oof_qc <- lm(y ~ oof_preds)
+cat("\n[Calibration — Internal OOF]\n")
+cat(sprintf("  slope = %.3f | intercept = %.3f\n",
+            coef(fit_oof_qc)[2], coef(fit_oof_qc)[1]))
+cal_oof <- data.frame(
+  split="internal_oof",
+  slope=unname(coef(fit_oof_qc)[2]),
+  intercept=unname(coef(fit_oof_qc)[1])
+)
+# No separate CSV; slopes/intercepts live in internal_cv_metrics_CI.csv
+
+# Pooled OOF R^2
+r2_oof_pooled <- 1 - sum((y - oof_preds)^2) / sum((y - mean(y))^2)
+cat(sprintf("  pooled OOF R^2 = %.3f\n", r2_oof_pooled))
+
+# OOF-bootstrap CIs (this is your main CV file)
+oof_ci <- .oof_boot_ci(y, oof_preds, B = B_OOF, seed = SEED_MAIN)
+write.csv(oof_ci, file.path(out_dir, "internal_cv_metrics_CI.csv"), row.names = FALSE)
+cat("\n[Internal CV 95% CIs from OOF]\n"); print(oof_ci)
+
+# Fold-bootstrap CIs (no export; diagnostic only)
+cv10_ci <- .cv_fold_boot_ci(metrics, B = B_FOLDS, seed = SEED_MAIN)
+if ("R2" %in% cv10_ci$Metric) {
+  r_oof <- subset(oof_ci, Metric == "R2")
+  cv10_ci$Est[cv10_ci$Metric=="R2"]      <- r_oof$Est
+  cv10_ci$CI_Lower[cv10_ci$Metric=="R2"] <- r_oof$CI_Lower
+  cv10_ci$CI_Upper[cv10_ci$Metric=="R2"] <- r_oof$CI_Upper
+}
+cat("\n[10-fold CV 95% CIs (bootstrap over folds)]\n"); print(cv10_ci)
+
+
+# -------------------------
+# 9. Final Model (apparent fit) + Calibration Plot
+# -------------------------
+final_model <- SuperLearner(
+  Y=y, X=X, family=gaussian(), SL.library=sl_lib,
+  cvControl=list(V = max(2, min(K_FOLDS_MAIN, floor(nrow(X)/3))))
+)
+final_preds <- predict(final_model, newdata=X)$pred
+
+mse <- mean((y-final_preds)^2)
+rmse <- sqrt(mse)
+mae <- mean(abs(y-final_preds))
+r2  <- 1 - sum((y-final_preds)^2) / sum((y-mean(y))^2)
+cat(sprintf("Final Model Performance (Apparent Fit):\nRMSE = %.3f\nMAE = %.3f\nR-squared = %.3f\n", rmse, mae, r2))
+cat("\nFinal Model Weights:\n"); print(final_model$coef)
+
+plot_df <- data.frame(Actual=y, Predicted=final_preds)
+p <- ggplot(plot_df, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(title = "Calibration Plot: Super Learner Predictions (Apparent Fit)",
+       x = "Actual Velocity", y = "Predicted Velocity") +
+  theme_minimal() +
+  coord_equal() +
+  scale_x_continuous(limits = c(85, 100)) +
+  scale_y_continuous(limits = c(85, 100))
+print(p)
+
+
+# -------------------------
+# 10. Variable Importance (overall)
+# -------------------------
+importance <- get_variable_importance(final_model, X)
+cat("\nVariable Importance (Weighted Across Learners):\n"); print(importance)
+
+
+# -------------------------
+# 11. Internal–External Validation (ACC vs SEC)
+# -------------------------
+external_acc <- run_external_validation(data_combined, "SEC", "ACC")
+external_sec <- run_external_validation(data_combined, "ACC", "SEC")
+
+cat("\nExternal Validation: SEC→ACC\n"); print(external_acc$metrics)
+cat("\nExternal Validation: ACC→SEC\n"); print(external_sec$metrics)
+
+
+
+# SEC → ACC (model trained on SEC)
+idx_SEC <- which(data_combined$conference == "SEC")
+X_train_SEC <- X[idx_SEC, , drop = FALSE]
+vi_SECtrain <- get_variable_importance(external_acc$model, X_train_SEC)
+vi_SECtrain_df <- data.frame(
+  Variable = names(vi_SECtrain),
+  Importance = as.numeric(vi_SECtrain),
+  stringsAsFactors = FALSE
+) |>
+  dplyr::mutate(Importance_Percent = 100*Importance/sum(Importance, na.rm=TRUE)) |>
+  dplyr::arrange(dplyr::desc(Importance_Percent))
+write.csv(vi_SECtrain_df, file.path(out_dir, "variable_importance_train_SEC_IE_to_ACC.csv"), row.names = FALSE)
+
+p_vi_sec <- ggplot(vi_SECtrain_df,
+                   aes(x = reorder(Variable, Importance_Percent), y = Importance_Percent)) +
+  geom_col() + coord_flip() +
+  labs(title = "Variable Importance — Train: SEC (IE to ACC)", x = NULL, y = "Importance (%)") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+ggsave(file.path(plots_dir, "VI_train_SEC_IE_to_ACC.png"), p_vi_sec, width = 8, height = 8, dpi = 300)
+
+# ACC → SEC (model trained on ACC)
+idx_ACC <- which(data_combined$conference == "ACC")
+X_train_ACC <- X[idx_ACC, , drop = FALSE]
+vi_ACCtrain <- get_variable_importance(external_sec$model, X_train_ACC)
+vi_ACCtrain_df <- data.frame(
+  Variable = names(vi_ACCtrain),
+  Importance = as.numeric(vi_ACCtrain),
+  stringsAsFactors = FALSE
+) |>
+  dplyr::mutate(Importance_Percent = 100*Importance/sum(Importance, na.rm=TRUE)) |>
+  dplyr::arrange(dplyr::desc(Importance_Percent))
+write.csv(vi_ACCtrain_df, file.path(out_dir, "variable_importance_train_ACC_IE_to_SEC.csv"), row.names = FALSE)
+
+p_vi_acc <- ggplot(vi_ACCtrain_df,
+                   aes(x = reorder(Variable, Importance_Percent), y = Importance_Percent)) +
+  geom_col() + coord_flip() +
+  labs(title = "Variable Importance — Train: ACC (IE to SEC)", x = NULL, y = "Importance (%)") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+ggsave(file.path(plots_dir, "VI_train_ACC_IE_to_SEC.png"), p_vi_acc, width = 8, height = 8, dpi = 300)
+
+# IE bootstrap CIs (metrics + calibration)
+ie_ci_acc <- .ie_boot_ci(external_acc$preds_df, B = B_IE, seed = SEED_MAIN)
+ie_ci_sec <- .ie_boot_ci(external_sec$preds_df, B = B_IE, seed = SEED_MAIN)
+write.csv(ie_ci_acc, file.path(out_dir,"IE_SEC_to_ACC_CI.csv"), row.names=FALSE)
+write.csv(ie_ci_sec, file.path(out_dir,"IE_ACC_to_SEC_CI.csv"), row.names=FALSE)
+cat("\n[IE 95% CIs] SEC → ACC\n"); print(ie_ci_acc)
+cat("\n[IE 95% CIs] ACC → SEC\n"); print(ie_ci_sec)
+
+# Simple IE calibration plots
+.save_cal_plot(external_acc$preds_df,
+               "Calibration: SEC → ACC (with 95% CI)",
+               "calibration_SEC_to_ACC_CI.png", with_se=TRUE)
+.save_cal_plot(external_sec$preds_df,
+               "Calibration: ACC → SEC (with 95% CI)",
+               "calibration_ACC_to_SEC_CI.png", with_se=TRUE)
+
+
+# =====================================================================
+# 12. FIGURES – Internal CV Calibration
+# =====================================================================
+df_fig1 <- data.frame(
+  Actual=as.numeric(y),
+  Predicted=as.numeric(oof_preds),
+  Conference=if (!is.null(conf_vec)) factor(conf_vec, levels=c("ACC","SEC")) else NULL
+)
+df_fig1 <- df_fig1[is.finite(df_fig1$Actual) & is.finite(df_fig1$Predicted), ]
+
+LIMS <- c(85, 100)
+col_fitline <- "purple"; col_perfect <- "grey"; col_acc <- "salmon"; col_sec <- "cyan"
+theme_ref <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title=element_text(size=16, face="bold", hjust=0.5, margin=margin(b=6)),
+    axis.title.x=element_text(size=13, face="bold", margin=margin(t=6)),
+    axis.title.y=element_text(size=13, face="bold", margin=margin(r=6)),
+    legend.position=if (!is.null(conf_vec)) "right" else "none",
+    legend.title=element_text(size=12, face="bold"),
+    legend.text=element_text(size=11),
+    panel.grid.minor=element_blank(),
+    panel.grid.major=element_line(color="grey90", linewidth=0.4),
+    plot.margin=margin(8,12,8,12)
+  )
+
+fit_cal <- lm(Predicted ~ Actual, data=df_fig1)
+b0 <- unname(coef(fit_cal)[1]); b1 <- unname(coef(fit_cal)[2])
+
+p_fig1 <- ggplot(df_fig1, aes(Actual, Predicted)) +
+  { if (!is.null(conf_vec)) geom_point(aes(color = Conference), size = 2.6, alpha = 0.85) else
+    geom_point(color = "#2F2F2F", size = 2.6, alpha = 0.85) } +
+  geom_abline(slope = 1, intercept = 0, color = col_perfect, linetype = "dashed", linewidth = 1.1) +
+  geom_abline(slope = b1, intercept = b0, color = col_fitline, linewidth = 1.1) +
+  { if (!is.null(conf_vec)) scale_color_manual(values = c(ACC = col_acc, SEC = col_sec),
+                                               name = "Conference") else NULL } +
+  coord_fixed(ratio = 1, xlim = LIMS, ylim = LIMS, expand = FALSE) +
+  scale_x_continuous(limits = LIMS, breaks = seq(85, 100, 3)) +
+  scale_y_continuous(limits = LIMS, breaks = seq(85, 100, 3)) +
+  labs(title = "SuperLearner Calibration Performance Evaluation",
+       x = "Actual RelSpeed", y = "Predicted RelSpeed") +
+  theme_ref
+print(p_fig1)
+ggsave(file.path(plots_dir, "Figure1_InternalCV_Calibration_FIXEDLIMITS.png"),
+       p_fig1, width=7.5, height=7.5, dpi=300)
+
+
+# =====================================================================
+# 13. IE Figures – Full-Refit Bootstrap with Per-Point 95% CI
+# =====================================================================
+ie_bootstrap_fullrefit_split <- function(
+    data, train_conf, test_conf,
+    sl_lib, B = B_IE_FULL, seed = SEED_MAIN,
+    inner_V = INNER_V_IE, use_parallel = USE_PAR_IE_BOOT,
+    fixed_limits = NULL, file_out = NULL,
+    pad_xy = c(0.6, 0.6),
+    main_fit = NULL,
+    label_override = NULL   # <<< NEW
+) {
+  # use screened X,y for design
+  train_idx <- which(data$conference == train_conf)
+  test_idx  <- which(data$conference == test_conf)
+  
+  Xtr <- X[train_idx, , drop = FALSE]
+  ytr <- y[train_idx]
+  Xte <- X[test_idx,  , drop = FALSE]
+  yte <- y[test_idx]
+  
+  test_df <- data[test_idx, , drop = FALSE]
+  
+  if ("Handedness" %in% names(Xtr)) {
+    Xtr$Handedness <- as.factor(Xtr$Handedness)
+    Xte$Handedness <- factor(Xte$Handedness, levels = levels(Xtr$Handedness))
+  }
+  
+  ## --------- MAIN (NON-BOOTSTRAP) FIT ----------
+  if (is.null(main_fit)) {
+    main_fit <- SuperLearner(
+      Y = ytr, X = Xtr, family = gaussian(),
+      SL.library = sl_lib,
+      cvControl  = list(
+        V = max(2, min(K_FOLDS_MAX_INNER, floor(nrow(Xtr)/3)))
+      )
+    )
+  }
+  main_pred <- as.numeric(predict(main_fit, newdata = Xte, onlySL = TRUE)$pred)
+  
+  # Guarded bootstrap indices 
+  make_boot_indices <- function(n, B, y, max_tries = 20L) {
+    out <- vector("list", B)
+    for (b in seq_len(B)) {
+      tries <- 0L
+      repeat {
+        idx <- sample.int(n, replace = TRUE)
+        ok_y  <- (sd(y[idx]) > 0)
+        ok_nu <- (length(unique(idx)) >= min(5L, n))
+        if (ok_y && ok_nu) { out[[b]] <- idx; break }
+        tries <- tries + 1L
+        if (tries >= max_tries) { out[[b]] <- idx; break }
+      }
+    }
+    out
+  }
+  set.seed(seed)
+  resample_idx <- make_boot_indices(nrow(Xtr), B, ytr)
+  
+  # Worker refit
+  run_one <- function(idx) {
+    if (length(unique(ytr[idx])) < 2L) {
+      return(rep(NA_real_, nrow(Xte)))
+    }
+    fit_b <- try(
+      SuperLearner(
+        Y = ytr[idx], X = Xtr[idx, , drop = FALSE], family = gaussian(),
+        SL.library = sl_lib, cvControl = list(V = inner_V), verbose = FALSE
+      ),
+      silent = TRUE
+    )
+    if (inherits(fit_b, "try-error")) {
+      return(rep(NA_real_, nrow(Xte)))
+    }
+    pr <- try(as.numeric(predict(fit_b, newdata = Xte, onlySL = TRUE)$pred), silent = TRUE)
+    if (inherits(pr, "try-error")) {
+      return(rep(NA_real_, nrow(Xte)))
+    }
+    pr
+  }
+  
+  # Execute bootstrap
+  if (use_parallel) {
+    cl <- parallel::makeCluster(max(1, parallel::detectCores() - 1))
+    on.exit(parallel::stopCluster(cl), add = TRUE)
+    parallel::clusterEvalQ(cl, {
+      suppressPackageStartupMessages({
+        library(SuperLearner); library(ranger); library(xgboost)
+        library(glmnet); library(earth); library(kernlab)
+      })
+      NULL
+    })
+    custom_fns <- sl_lib[sl_lib %in% ls(.GlobalEnv)]
+    if (length(custom_fns)) parallel::clusterExport(cl, varlist = custom_fns, envir = .GlobalEnv)
+    parallel::clusterExport(cl, varlist = c("Xtr","ytr","Xte","sl_lib","inner_V"), envir = environment())
+    pred_list <- parallel::parLapply(cl, resample_idx, run_one)
+  } else {
+    pred_list <- lapply(resample_idx, run_one)
+  }
+  
+  # Combine and drop all-NA columns
+  boot_mat <- do.call(cbind, pred_list)
+  if (is.null(boot_mat)) {
+    boot_mat <- matrix(numeric(0), nrow = length(yte), ncol = 0)
+  }
+  if (ncol(boot_mat) > 0) {
+    keep   <- !apply(boot_mat, 2, function(col) all(!is.finite(col)))
+    boot_mat <- if (any(keep)) boot_mat[, keep, drop = FALSE] else matrix(numeric(0), nrow = length(yte), ncol = 0)
+  }
+  
+  # Fallback if no usable columns
+  if (ncol(boot_mat) == 0) {
+    plot_df <- data.frame(
+      Actual = yte, Predicted = main_pred,
+      Lower_CI = NA_real_, Upper_CI = NA_real_,
+      Conference = factor(test_conf, levels = c("ACC","SEC")),
+      PitcherID = test_df$PitcherID
+    )
+    rmse_main <- sqrt(mean((yte - main_pred)^2))
+    r2_main   <- 1 - sum((yte - main_pred)^2) / sum((yte - mean(yte))^2)
+    if (!is.null(fixed_limits)) { xlim <- fixed_limits$x; ylim <- fixed_limits$y } else {
+      xlim <- range(plot_df$Actual, na.rm = TRUE)
+      ylim <- range(plot_df$Predicted, na.rm = TRUE)
+    }
+    xlim <- xlim + c(-pad_xy[1], +pad_xy[1])
+    ylim <- ylim + c(-pad_xy[2], +pad_xy[2])
+    
+    if (!is.null(label_override)) {
+      ann_lab <- label_override          # <<< use hard-coded text
+    } else {
+      ann_lab <- sprintf("RMSE: %.2f (%.2f–%.2f)\nR²: %.2f (%.2f–%.2f)",
+                         rmse_main, rmse_ci[1], rmse_ci[2],
+                         r2_main,   r2_ci[1],   r2_ci[2])
+    }
+    
+    p_ie <- ggplot(plot_df, aes(Actual, Predicted, color = Conference)) +
+      geom_point(size = 2.3, alpha = 0.90) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+                  linewidth = 0.6, color = "gray50") +
+      labs(title = "SuperLearner Performance (no usable bootstrap cols)",
+           x = "Actual RelSpeed", y = "Predicted RelSpeed") +
+      scale_color_discrete(name = "Conference") +
+      coord_cartesian(xlim = xlim, ylim = ylim, expand = FALSE, clip = "off") +
+      theme_minimal(base_size = 12) +
+      annotate("text",
+               x = xlim[1] + 0.4, y = ylim[2] - 0.4,
+               hjust = 0, vjust = 1, size = 4, label = ann_lab)
+    
+    print(p_ie)
+    if (!is.null(file_out)) {
+      ggsave(file_out, plot = p_ie, width = 9, height = 6.5, dpi = 300)
+    }
+    return(invisible(list(
+      plot = p_ie, data = plot_df, boot = boot_mat,
+      metrics = data.frame(RMSE = rmse_main, R2 = r2_main)
+    )))
+  }
+  
+  # Pointwise CI centered on main_pred
+  delta  <- sweep(boot_mat, 1, main_pred, "-")
+  lo_dev <- apply(delta, 1, quantile, 0.025, na.rm = TRUE)
+  hi_dev <- apply(delta, 1, quantile, 0.975, na.rm = TRUE)
+  lower  <- main_pred + lo_dev
+  upper  <- main_pred + hi_dev
+  
+  # Metrics & plot
+  rmse_main <- sqrt(mean((yte - main_pred)^2))
+  r2_main   <- 1 - sum((yte - main_pred)^2) / sum((yte - mean(yte))^2)
+  rmse_ci   <- quantile(apply(boot_mat, 2, function(p) sqrt(mean((yte - p)^2))),
+                        c(.025,.975), na.rm = TRUE)
+  r2_ci     <- quantile(apply(boot_mat, 2, function(p)
+    1 - sum((yte - p)^2) / sum((yte - mean(yte))^2)),
+    c(.025,.975), na.rm = TRUE)
+  
+  plot_df <- data.frame(
+    Actual = yte, Predicted = main_pred,
+    Lower_CI = lower, Upper_CI = upper,
+    Conference = factor(test_conf, levels = c("ACC","SEC")),
+    PitcherID = test_df$PitcherID
+  )
+  
+  if (!is.null(fixed_limits)) {
+    xlim <- fixed_limits$x; ylim <- fixed_limits$y
+  } else {
+    xlim <- range(plot_df$Actual, na.rm = TRUE)
+    ylim <- range(c(plot_df$Lower_CI, plot_df$Upper_CI), na.rm = TRUE)
+  }
+  xlim <- xlim + c(-pad_xy[1], +pad_xy[1])
+  ylim <- ylim + c(-pad_xy[2], +pad_xy[2])
+  
+  
+  p_ie <- ggplot(plot_df, aes(Actual, Predicted, color = Conference)) +
+    geom_linerange(aes(ymin = Lower_CI, ymax = Upper_CI), linewidth = 0.7, alpha = 0.70) +
+    geom_point(size = 2.3, alpha = 0.90) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+                linewidth = 0.6, color = "gray50") +
+    labs(title = "SuperLearner Performance with Bootstrap (95% CI)",
+         x = "Actual RelSpeed", y = "Predicted RelSpeed") +
+    scale_color_discrete(name = "Conference") +
+    coord_cartesian(xlim = xlim, ylim = ylim, expand = FALSE, clip = "off") +
+    theme_minimal(base_size = 12)
+  
+  print(p_ie)
+  if (!is.null(file_out)) {
+    ggsave(file_out, plot = p_ie, width = 9, height = 6.5, dpi = 300)
+  }
+  
+  invisible(list(
+    plot = p_ie, data = plot_df, boot = boot_mat,
+    metrics = data.frame(
+      RMSE = rmse_main, R2 = r2_main,
+      RMSE_L = rmse_ci[1], RMSE_U = rmse_ci[2],
+      R2_L   = r2_ci[1],   R2_U   = r2_ci[2]
+    )
+  ))
+}
+
+# Optional full-refit IE figures
+
+file_ACC <- if (dir.exists(plots_dir)) file.path(plots_dir, "IE_SEC_to_ACC_bootstrap_errorbars.png") else NULL
+res_ACC <- ie_bootstrap_fullrefit_split(
+  data        = data_combined,
+  train_conf  = "SEC",
+  test_conf   = "ACC",
+  sl_lib      = sl_lib,
+  B           = B_IE_FULL,
+  seed        = SEED_MAIN,
+  inner_V     = INNER_V_IE,
+  use_parallel= USE_PAR_IE_BOOT,
+  fixed_limits= axes_ACC,
+  file_out    = file_ACC,
+  main_fit    = external_acc$model
+)
+
+
+file_SEC <- if (dir.exists(plots_dir)) file.path(plots_dir, "IE_ACC_to_SEC_bootstrap_errorbars.png") else NULL
+res_SEC <- ie_bootstrap_fullrefit_split(
+  data        = data_combined,
+  train_conf  = "ACC",
+  test_conf   = "SEC",
+  sl_lib      = sl_lib,
+  B           = B_IE_FULL,
+  seed        = SEED_MAIN,
+  inner_V     = INNER_V_IE,
+  use_parallel= USE_PAR_IE_BOOT,
+  fixed_limits= axes_SEC,
+  file_out    = file_SEC,
+  main_fit    = external_sec$model
+)
+
+
+
+# =====================================================================
+# 14. Overall Variable Importance Plot
+# =====================================================================
+vi_df_plot <- data.frame(
+  Variable=names(importance),
+  Importance=as.numeric(importance),
+  stringsAsFactors=FALSE
+) %>%
+  dplyr::mutate(Importance_Percent=100*Importance/sum(Importance, na.rm=TRUE)) %>%
+  dplyr::arrange(dplyr::desc(Importance_Percent))
+
+p_vi <- ggplot(vi_df_plot, aes(x=reorder(Variable, Importance_Percent), y=Importance_Percent)) +
+  geom_col(fill="blue") + coord_flip() +
+  labs(title="Overall Variable Importance", x=NULL, y="Importance (%)") +
+  theme_minimal(base_size=12) +
+  theme(plot.title=element_text(hjust=0.5, face="bold"))
+print(p_vi)
+ggsave(file.path(plots_dir,"Overall_Variable_Importance.png"), p_vi, width=8, height=8, dpi=300)
+
+
+# =====================================================================
+# 15. Baseline Saves: Metrics, Weights, VI, Calibration Plots
+# =====================================================================
+
+# Apparent (full-data) fit metrics
+write.csv(data.frame(RMSE=rmse, MAE=mae, R2=r2),
+          file.path(out_dir,"apparent_model_metrics_overall.csv"), row.names=FALSE)
+
+# Apparent (full-data) SuperLearner weights
+w_app <- as.numeric(final_model$coef)
+w_app_pct <- round(100 * w_app / sum(w_app), 1)
+slw <- data.frame(
+  Algorithm = names(final_model$coef),
+  WeightPct = w_app_pct
+)
+write.csv(slw, file.path(out_dir,"apparent_model_weights_overall.csv"), row.names=FALSE)
+
+# Overall VI
+vi_df <- data.frame(Variable=names(importance), Importance=as.numeric(importance))
+vi_df$Importance_Percent <- 100 * vi_df$Importance / sum(vi_df$Importance)
+write.csv(vi_df, file.path(out_dir,"variable_importance_weighted.csv"), row.names=FALSE)
+
+# Plots
+ggsave(filename=file.path(plots_dir,"calibration_apparent.png"),
+       plot=p, width=8, height=6, dpi=300)
+.save_cal_plot(
+  data.frame(Actual=y, Predicted=oof_preds),
+  "Calibration: Internal OOF",
+  "calibration_internal_oof.png",
+  with_se=TRUE
+)
+
+
+# =====================================================================
+# 16. Reporting Block: Session Info, Descriptives, Correlations
+# =====================================================================
+sink(file.path(out_dir, "session_info.txt")); print(sessionInfo()); sink()
+pk <- as.data.frame(installed.packages()[, c("Package","Version")], stringsAsFactors = FALSE)
+pk <- pk[order(pk$Package), ]
+write.csv(pk, file.path(out_dir, "package_versions.csv"), row.names = FALSE)
+
+# Descriptives
+num_vars <- data_combined %>%
+  dplyr::select(where(is.numeric)) %>%
+  names()
+
+desc_overall <- data_combined %>%
+  dplyr::summarise(dplyr::across(
+    all_of(num_vars),
+    list(mean = ~mean(.x, na.rm=TRUE),
+         sd   = ~sd(.x,   na.rm=TRUE),
+         n    = ~sum(!is.na(.x)))
+  ))
+write.csv(desc_overall, file.path(out_dir, "S1_descriptives_overall.csv"), row.names = FALSE)
+
+desc_by_conf <- data_combined %>%
+  dplyr::group_by(conference) %>%
+  dplyr::summarise(dplyr::across(
+    all_of(num_vars),
+    list(mean = ~mean(.x, na.rm=TRUE),
+         sd   = ~sd(.x,   na.rm=TRUE),
+         n    = ~sum(!is.na(.x)))
+  ), .groups = "drop")
+write.csv(desc_by_conf, file.path(out_dir, "S1_descriptives_by_conference.csv"), row.names = FALSE)
+
+# Correlations
+X_mat <- model.matrix(~ . - 1, data = X)
+corr_predpred <- stats::cor(X_mat, use = "pairwise.complete.obs")
+write.csv(corr_predpred, file.path(out_dir, "S2_corr_predictor_predictor.csv"))
+
+corr_with_y <- stats::cor(X_mat, y, use = "pairwise.complete.obs")
+write.csv(corr_with_y, file.path(out_dir, "S2_corr_predictor_with_velocity.csv"))
+
+
+
+
+
+# =====================================================================
+# 17. Pooled-OOF Meta-Learner Weights (NNLS)
+# =====================================================================
+coverage <- colMeans(!is.na(oof_base))
+ok_cols  <- names(coverage)[coverage >= 0.80]
+
+if (length(ok_cols) < 2) {
+  warning("Insufficient OOF coverage for pooled NNLS (fewer than 2 algorithms meet the threshold); skipping pooled weights.")
+} else {
+  M <- oof_base[, ok_cols, drop = FALSE]
+  rows_keep <- complete.cases(M) & is.finite(y)
+  if (sum(rows_keep) < max(10, ncol(M) + 1)) {
+    warning("Too few complete OOF rows for pooled NNLS after filtering; skipping pooled weights.")
+  } else {
+    nn <- nnls::nnls(M[rows_keep, , drop = FALSE], y[rows_keep])
+    pooled_w <- as.numeric(nn$coef)
+    if (sum(pooled_w) > 0 && all(is.finite(pooled_w))) pooled_w <- pooled_w / sum(pooled_w)
+    
+    pooled_weights_df <- data.frame(
+      Algorithm = colnames(M),
+      Weight    = pooled_w,
+      Coverage  = round(100 * coverage[colnames(M)], 1),
+      row.names = NULL, check.names = FALSE
+    )
+    write.csv(pooled_weights_df, file.path(out_dir, "pooled_oof_weights.csv"), row.names = FALSE)
+    
+    cat("\n[Pooled-OOF Meta-Learner Weights]\n")
+    for (i in seq_len(nrow(pooled_weights_df))) {
+      cat(sprintf("  %-25s : %5.1f%%  (coverage: %4.0f%%)\n",
+                  pooled_weights_df$Algorithm[i],
+                  100 * as.numeric(pooled_weights_df$Weight[i]),
+                  pooled_weights_df$Coverage[i]))
+    }
+  }
+}
+
+
+# =====================================================================
+# 18. IE Weights per Direction (Exports)
+# =====================================================================
+if (is.list(external_acc) && !is.null(external_acc$weights)) {
+  wa <- round(100 * as.numeric(external_acc$weights) / sum(as.numeric(external_acc$weights)), 1)
+  write.csv(
+    data.frame(Algorithm = names(external_acc$weights), WeightPct = wa),
+    file.path(out_dir, "weights_SEC_to_ACC.csv"),
+    row.names = FALSE
+  )
+}
+if (is.list(external_sec) && !is.null(external_sec$weights)) {
+  ws <- round(100 * as.numeric(external_sec$weights) / sum(as.numeric(external_sec$weights)), 1)
+  write.csv(
+    data.frame(Algorithm = names(external_sec$weights), WeightPct = ws),
+    file.path(out_dir, "weights_ACC_to_SEC.csv"),
+    row.names = FALSE
+  )
+}
+
+
+# =====================================================================
+# 19. Export Per-Fold SL Weights
+# =====================================================================
+write.csv(as.data.frame(weights_mat),
+          file.path(out_dir, "per_fold_weights.csv"), row.names = TRUE)
+
+# Summary in same "one row per algorithm" style 
+fold_weight_summary <- data.frame(
+  Algorithm  = colnames(weights_mat),
+  MeanWeight = colMeans(weights_mat, na.rm = TRUE),
+  row.names = NULL
+)
+write.csv(fold_weight_summary,
+          file.path(out_dir, "per_fold_weights_summary.csv"), row.names = FALSE)
+
+
+# =====================================================================
+# 20. Sensitivity Analyses (no height / no height+mass)
+# =====================================================================
+run_sensitivity <- function(exclude_vars = character(), label = "no_height") {
+  message("\n--- Running sensitivity: ", label, " (exclude: ",
+          ifelse(length(exclude_vars)==0,"<none>", paste(exclude_vars, collapse=", ")), ") ---")
+  ex <- intersect(exclude_vars, colnames(X))
+  Xs <- X %>% dplyr::select(-dplyr::any_of(ex))
+  
+  # Internal CV with OOF preds
+  set.seed(SEED_MAIN)
+  kf <- min(K_FOLDS_MAIN, max(2, floor(nrow(Xs)/3)))
+  flds <- caret::createFolds(y, k = kf, returnTrain = FALSE)
+  oof  <- numeric(length(y))
+  mtab <- data.frame(Fold = 1:kf, MSE = NA, RMSE = NA, MAE = NA, R2 = NA)
+  for (i in 1:kf) {
+    te <- flds[[i]]
+    trX <- Xs[-te, , drop=FALSE]; trY <- y[-te]
+    teX <- Xs[ te, , drop=FALSE]; teY <- y[ te]
+    mdl <- SuperLearner(
+      Y = trY, X = trX, family = gaussian(), SL.library = sl_lib,
+      cvControl = list(V = max(2, min(K_FOLDS_MAX_INNER, floor(nrow(trX)/3))))
+    )
+    pr  <- predict(mdl, newdata = teX)$pred
+    oof[te] <- pr
+    mse <- mean((teY - pr)^2); rmse <- sqrt(mse); mae <- mean(abs(teY - pr))
+    r2  <- 1 - sum((teY - pr)^2) / sum((teY - mean(teY))^2)
+    mtab[i, 2:5] <- c(mse, rmse, mae, r2)
+  }
+  sens_cv_summary <- mtab %>%
+    dplyr::summarise(dplyr::across(MSE:R2, list(mean=mean, sd=sd), na.rm=TRUE))
+  # Sensitivity CV summary
+  write.csv(sens_cv_summary,
+            file.path(out_dir, paste0("sensitivity_", label, "_cv_summary.csv")),
+            row.names=FALSE)
+  
+  # OOF calibration (sensitivity) – slope/intercept file
+  fit_oof <- lm(y ~ oof)
+  cal_oof <- data.frame(
+    split     = paste0("internal_oof_", label),
+    slope     = unname(coef(fit_oof)[2]),
+    intercept = unname(coef(fit_oof)[1])
+  )
+  write.csv(cal_oof,
+            file.path(out_dir, paste0("sensitivity_", label, "_calibration_internal_oof.csv")),
+            row.names = FALSE)
+  
+  # Final model + VI 
+  final_sens <- SuperLearner(
+    Y = y, X = Xs, family = gaussian(), SL.library = sl_lib,
+    cvControl = list(V = max(2, min(K_FOLDS_MAIN, floor(nrow(Xs)/3))))
+  )
+  vp <- predict(final_sens, newdata = Xs)$pred
+  write.csv(.metricise(y, oof),
+            file.path(out_dir, paste0("sensitivity_", label, "_final_metrics.csv")),
+            row.names=FALSE)
+  
+  vi <- get_variable_importance(final_sens, Xs)
+  vi_df2 <- data.frame(Variable=names(vi), Importance=as.numeric(vi))
+  write.csv(vi_df2,
+            file.path(out_dir, paste0("sensitivity_", label, "_variable_importance_weighted.csv")),
+            row.names=FALSE)
+  
+  # IE (sensitivity; both directions) – metrics and calibration
+  run_external_validation_sens <- function(train_conf, test_conf) {
+    train_idx <- which(data_combined$conference == train_conf)
+    test_idx  <- which(data_combined$conference == test_conf)
+    Xtr <- Xs[train_idx, , drop=FALSE]
+    Ytr <- y[train_idx]
+    Xte <- Xs[test_idx, , drop=FALSE]
+    Yte <- y[test_idx]
+    
+    set.seed(SEED_MAIN)
+    mdl <- SuperLearner(
+      Y = Ytr, X = Xtr, family = gaussian(), SL.library = sl_lib,
+      cvControl = list(V = max(2, min(K_FOLDS_MAX_INNER, floor(nrow(Xtr)/3))))
+    )
+    pr <- predict(mdl, newdata = Xte)$pred
+    list(
+      metrics  = .metricise(Yte, pr),
+      preds_df = data.frame(Actual=Yte, Predicted=pr, Conference=test_conf),
+      weights  = mdl$coef
+    )
+  }
+  
+  acc <- run_external_validation_sens("SEC", "ACC")
+  sec <- run_external_validation_sens("ACC", "SEC")
+  ext_metrics <- rbind(
+    data.frame(Direction="SEC_to_ACC", acc$metrics),
+    data.frame(Direction="ACC_to_SEC", sec$metrics)
+  )
+  write.csv(ext_metrics,
+            file.path(out_dir, paste0("sensitivity_", label, "_external_metrics.csv")),
+            row.names=FALSE)
+  
+  # IE calibration (sensitivity) – slope/intercept file
+  fit_e1 <- lm(Actual ~ Predicted, data = acc$preds_df)
+  fit_e2 <- lm(Actual ~ Predicted, data = sec$preds_df)
+  ext_cal <- rbind(
+    data.frame(split=paste0("SEC_to_ACC_", label),
+               slope=unname(coef(fit_e1)[2]),
+               intercept=unname(coef(fit_e1)[1])),
+    data.frame(split=paste0("ACC_to_SEC_", label),
+               slope=unname(coef(fit_e2)[2]),
+               intercept=unname(coef(fit_e2)[1]))
+  )
+  write.csv(ext_cal,
+            file.path(out_dir, paste0("sensitivity_", label, "_calibration_external_IE.csv")),
+            row.names = FALSE)
+  
+  invisible(TRUE)
+}
+
+
+if ("HEIGHT" %in% colnames(X)) {
+  run_sensitivity(exclude_vars = c("HEIGHT"), label = "no_height")
+} else {
+  warning("HEIGHT not found in X; skipping no-height sensitivity.")
+}
+if (all(c("HEIGHT","MASS") %in% colnames(X))) {
+  run_sensitivity(exclude_vars = c("HEIGHT","MASS"), label = "no_height_mass")
+}
+
+
+# =====================================================================
+# 21. Quick Comparison Table (CV vs IE vs Apparent)
+# =====================================================================
+fmt  <- function(x, d = 3) {
+  if (is.null(x) || is.na(x)) NA_character_ else formatC(as.numeric(x), digits = d, format = "f")
+}
+get_row <- function(setting, m) {
+  data.frame(
+    Setting=setting,
+    RMSE=fmt(m$RMSE),
+    MAE =fmt(m$MAE),
+    R2  =fmt(m$R2),
+    stringsAsFactors=FALSE
+  )
+}
+
+rows <- list(
+  get_row("Internal 10-fold CV",
+          data.frame(RMSE=summary_metrics$RMSE_mean,
+                     MAE =summary_metrics$MAE_mean,
+                     R2  =r2_oof_pooled)),
+  get_row("Internal–External (SEC → ACC)", external_acc$metrics),
+  get_row("Internal–External (ACC → SEC)", external_sec$metrics),
+  get_row("Apparent (full-data fit)", data.frame(RMSE=rmse, MAE=mae, R2=r2))
+)
+comparison_tab <- do.call(rbind, Filter(Negate(is.null), rows))
+cat("\n===== Quick Comparison =====\n")
+if (nrow(comparison_tab)) print(comparison_tab, row.names=FALSE) else cat("(no rows to show)\n")
+
+
+
+var_y <- stats::var(y); mse_oof <- mean((y - oof_preds)^2)
+cat(sprintf("\n[Sanity] R^2 via variance identity = %.3f (should match pooled OOF R^2)\n",
+            1 - mse_oof / var_y))
+
+# Console recap
+cat("\n--- Calibration (slope / intercept) ---\n")
+cat(sprintf("  Internal OOF     : slope %.3f | intercept %.3f\n",
+            coef(fit_oof_qc)[2], coef(fit_oof_qc)[1]))
+f <- lm(Actual ~ Predicted, data=external_acc$preds_df)
+cat(sprintf("  SEC → ACC        : slope %.3f | intercept %.3f\n",
+            coef(f)[2], coef(f)[1]))
+f <- lm(Actual ~ Predicted, data=external_sec$preds_df)
+cat(sprintf("  ACC → SEC        : slope %.3f | intercept %.3f\n",
+            coef(f)[2], coef(f)[1]))
+
+cat("\n[IE 95% CI files]\n  - IE_SEC_to_ACC_CI.csv\n  - IE_ACC_to_SEC_CI.csv\n")
+cat("\n[Internal-CV CI file]\n  - internal_cv_metrics_CI.csv (OOF bootstrap)\n")
+cat("\n[Save Summary] Apparent + CV + IE outputs written to ", out_dir, "\n")
