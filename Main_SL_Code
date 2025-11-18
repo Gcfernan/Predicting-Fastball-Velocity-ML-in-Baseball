@@ -41,7 +41,7 @@ if (!dir.exists(plots_dir)) dir.create(plots_dir, recursive = TRUE)
 # -------------------------
 packages <- c(
   "SuperLearner","caret","ranger","xgboost","glmnet","earth","kernlab",
-  "naniar","ggplot2","ggrepel","dplyr","reshape2","pmsampsize","nnls",
+  "naniar","ggplot2","dplyr","pmsampsize","nnls",
   "parallel","car"
 )
 lapply(packages, function(pkg) {
